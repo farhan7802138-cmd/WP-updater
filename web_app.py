@@ -14,15 +14,23 @@ import test_local_server
 
 app = Flask(__name__)
 
-# Global state
+# Execution Global State
 execution_state = {
     "is_running": False,
     "current": 0,
     "total": 0,
-    "status_msg": "Ready to update.",
+    "status_msg": "Ready to launch update pipeline.",
+    "active_site": None,
     "logs": [],
     "latest_report": None,
-    "results": []
+    "stats": {
+        "total": 0,
+        "healthy": 0,
+        "failed": 0,
+        "plugins_updated": 0,
+        "themes_updated": 0
+    },
+    "recent_screenshots": []
 }
 
 orchestrator_instance = None
@@ -30,252 +38,771 @@ mock_server_running = False
 
 def append_log(msg: str):
     timestamp = time.strftime("%H:%M:%S")
-    entry = f"[{timestamp}] {msg}"
+    entry = {"time": timestamp, "text": msg}
     execution_state["logs"].append(entry)
-    print(entry)
+    print(f"[{timestamp}] {msg}")
 
 def update_progress(current: int, total: int, msg: str):
     execution_state["current"] = current
     execution_state["total"] = total
     execution_state["status_msg"] = f"[{current}/{total}] {msg}"
+    execution_state["stats"]["total"] = total
 
-HTML_DASHBOARD = """<!DOCTYPE html>
+def on_site_updated(site_result: dict):
+    # Update live stats
+    pre = site_result.get("pre_check", {})
+    post = site_result.get("post_check", {})
+    upd = site_result.get("update_summary", {})
+
+    execution_state["stats"]["plugins_updated"] += upd.get("plugins_updated", 0)
+    execution_state["stats"]["themes_updated"] += upd.get("themes_updated", 0)
+
+    if post.get("is_healthy"):
+        execution_state["stats"]["healthy"] += 1
+    elif "is_healthy" in post:
+        execution_state["stats"]["failed"] += 1
+
+    # Add screenshots to live gallery
+    before_p = pre.get("screenshot_path")
+    after_p = post.get("screenshot_path")
+
+    if before_p or after_p:
+        item = {
+            "url": site_result.get("url"),
+            "before": f"/screenshots/{os.path.basename(before_p)}" if before_p else None,
+            "after": f"/screenshots/{os.path.basename(after_p)}" if after_p else None,
+            "healthy": post.get("is_healthy", False),
+            "status_code": post.get("status_code", pre.get("status_code", 200))
+        }
+        # Replace or append
+        existing = [i for i, x in enumerate(execution_state["recent_screenshots"]) if x["url"] == item["url"]]
+        if existing:
+            execution_state["recent_screenshots"][existing[0]] = item
+        else:
+            execution_state["recent_screenshots"].insert(0, item)
+
+HTML_PROFESSIONAL_DASHBOARD = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WordPress Auto-Updater Dashboard</title>
+    <title>WP Auto-Updater Enterprise &bull; Playwright</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg-dark: #0f172a;
-            --panel-bg: #1e293b;
-            --border: #334155;
+            --bg-body: #090d16;
+            --bg-card: #0f172a;
+            --bg-card-hover: #131d35;
+            --bg-subtle: #1e293b;
+            --border-color: rgba(255, 255, 255, 0.08);
+            --border-hover: rgba(56, 189, 248, 0.3);
+            
             --primary: #38bdf8;
-            --primary-hover: #0284c7;
-            --success: #22c55e;
-            --danger: #ef4444;
-            --text-main: #f8fafc;
-            --text-muted: #94a3b8;
+            --primary-gradient: linear-gradient(135deg, #38bdf8 0%, #2563eb 100%);
+            --accent-green: #22c55e;
+            --accent-green-glow: rgba(34, 197, 94, 0.25);
+            --accent-red: #f43f5e;
+            --accent-yellow: #fbbf24;
+            --text-title: #f8fafc;
+            --text-body: #94a3b8;
+            --text-muted: #64748b;
         }
-        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: var(--bg-dark);
-            color: var(--text-main);
-            padding: 24px;
-        }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-        }
-        header {
-            background: var(--panel-bg);
-            border: 1px solid var(--border);
-            padding: 20px 24px;
-            border-radius: 12px;
-            margin-bottom: 20px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        h1 { font-size: 24px; color: var(--primary); font-weight: 700; }
-        .tagline { color: var(--text-muted); font-size: 14px; margin-top: 4px; }
-        .badge-live {
-            background: rgba(34, 197, 94, 0.15);
-            color: var(--success);
-            padding: 6px 14px;
-            border-radius: 20px;
-            border: 1px solid var(--success);
-            font-weight: 600;
-            font-size: 13px;
-        }
-        .grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 20px;
-            margin-bottom: 20px;
-        }
-        .panel {
-            background: var(--panel-bg);
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            padding: 20px;
+            font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
+            background-color: var(--bg-body);
+            color: var(--text-title);
+            min-height: 100vh;
             display: flex;
             flex-direction: column;
+            overflow-x: hidden;
         }
-        .panel h2 {
-            font-size: 16px;
-            margin-bottom: 12px;
+
+        /* Top Bar */
+        .navbar {
+            background: rgba(15, 23, 42, 0.85);
+            backdrop-filter: blur(16px);
+            border-bottom: 1px solid var(--border-color);
+            padding: 14px 32px;
             display: flex;
             justify-content: space-between;
             align-items: center;
+            position: sticky;
+            top: 0;
+            z-index: 50;
         }
-        textarea {
-            width: 100%;
-            height: 240px;
-            background: #090d16;
-            color: #e2e8f0;
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 12px;
-            font-family: "Consolas", monospace;
-            font-size: 13px;
-            resize: vertical;
-            outline: none;
-        }
-        textarea:focus { border-color: var(--primary); }
-        .terminal {
-            width: 100%;
-            height: 240px;
-            background: #000;
-            color: #38bdf8;
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 12px;
-            font-family: "Consolas", monospace;
-            font-size: 12px;
-            overflow-y: auto;
-            white-space: pre-wrap;
-        }
-        .controls {
-            margin-top: 14px;
+        .brand {
             display: flex;
-            gap: 12px;
             align-items: center;
-            flex-wrap: wrap;
+            gap: 12px;
         }
-        button {
-            border: none;
-            padding: 10px 20px;
-            border-radius: 8px;
-            font-weight: 600;
-            cursor: pointer;
-            font-size: 14px;
-            transition: all 0.2s;
+        .logo-icon {
+            width: 40px;
+            height: 40px;
+            background: var(--primary-gradient);
+            border-radius: 10px;
+            display: grid;
+            place-items: center;
+            font-weight: 800;
+            font-size: 20px;
+            color: #fff;
+            box-shadow: 0 0 20px rgba(56, 189, 248, 0.4);
         }
-        .btn-start {
-            background: var(--success);
-            color: white;
-        }
-        .btn-start:hover { filter: brightness(1.1); }
-        .btn-start:disabled { background: #475569; cursor: not-allowed; }
-        .btn-stop {
-            background: var(--danger);
-            color: white;
-        }
-        .btn-stop:disabled { background: #475569; cursor: not-allowed; }
-        .btn-secondary {
-            background: #334155;
-            color: #f8fafc;
-        }
-        .btn-secondary:hover { background: #475569; }
-        .checkbox-label {
+        .brand-text h1 {
+            font-size: 18px;
+            font-weight: 700;
+            letter-spacing: -0.3px;
             display: flex;
             align-items: center;
             gap: 8px;
-            font-size: 13px;
-            color: var(--text-muted);
-            cursor: pointer;
         }
-        .status-bar {
-            background: var(--panel-bg);
-            border: 1px solid var(--border);
+        .brand-text span.version {
+            font-size: 11px;
+            background: rgba(56, 189, 248, 0.15);
+            color: var(--primary);
+            padding: 2px 8px;
+            border-radius: 6px;
+            font-weight: 600;
+            border: 1px solid rgba(56, 189, 248, 0.3);
+        }
+        .brand-text p {
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+        .nav-actions {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .status-badge {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 14px;
+            background: rgba(34, 197, 94, 0.1);
+            border: 1px solid rgba(34, 197, 94, 0.3);
+            border-radius: 30px;
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--accent-green);
+        }
+        .pulse-dot {
+            width: 8px;
+            height: 8px;
+            background: var(--accent-green);
+            border-radius: 50%;
+            box-shadow: 0 0 10px var(--accent-green);
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.4; transform: scale(0.85); }
+        }
+
+        /* Container Layout */
+        .main-content {
+            max-width: 1440px;
+            width: 100%;
+            margin: 0 auto;
+            padding: 24px 32px;
+            flex-grow: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        /* Metrics Row */
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 16px;
+        }
+        .metric-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
             border-radius: 12px;
             padding: 16px 20px;
+            transition: all 0.2s ease;
+        }
+        .metric-card:hover {
+            border-color: var(--border-hover);
+            transform: translateY(-2px);
+        }
+        .metric-label {
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+        }
+        .metric-value {
+            font-size: 26px;
+            font-weight: 800;
+            letter-spacing: -0.5px;
+            color: var(--text-title);
+        }
+        .metric-value.highlight-blue { color: var(--primary); }
+        .metric-value.highlight-green { color: var(--accent-green); }
+        .metric-value.highlight-red { color: var(--accent-red); }
+
+        /* Workspace Grid (Two Columns) */
+        .workspace-grid {
+            display: grid;
+            grid-template-columns: 480px 1fr;
+            gap: 20px;
+            flex-grow: 1;
+        }
+
+        /* Common Panel */
+        .panel {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 14px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            box-shadow: 0 10px 30px -10px rgba(0,0,0,0.5);
+        }
+        .panel-header {
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border-color);
             display: flex;
             justify-content: space-between;
             align-items: center;
+            background: rgba(255, 255, 255, 0.015);
         }
-        .progress-text { font-size: 14px; font-weight: 600; color: var(--primary); }
-        .report-link {
-            color: var(--primary);
-            text-decoration: underline;
+        .panel-header h2 {
+            font-size: 14px;
+            font-weight: 700;
+            letter-spacing: -0.2px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .panel-body {
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            flex-grow: 1;
+        }
+
+        /* Editor Area */
+        .editor-wrapper {
+            position: relative;
+            flex-grow: 1;
+            display: flex;
+            flex-direction: column;
+        }
+        textarea.code-editor {
+            width: 100%;
+            height: 220px;
+            background: #060911;
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: 14px;
+            color: #e2e8f0;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12.5px;
+            line-height: 1.6;
+            resize: vertical;
+            outline: none;
+            transition: border 0.2s;
+        }
+        textarea.code-editor:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2);
+        }
+
+        /* Toolbar Chips */
+        .chips-bar {
+            display: flex;
+            gap: 8px;
+            margin-top: 8px;
+            align-items: center;
+        }
+        .chip {
+            background: var(--bg-subtle);
+            border: 1px solid var(--border-color);
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-size: 11px;
             font-weight: 600;
+            color: var(--text-body);
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .chip:hover {
+            color: #fff;
+            border-color: var(--primary);
+            background: rgba(56, 189, 248, 0.1);
+        }
+
+        /* Config Card */
+        .config-box {
+            background: #060911;
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: 14px 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        .switch-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 13px;
+        }
+        .switch-row span.label {
+            font-weight: 600;
+            color: var(--text-title);
+        }
+        .switch-row span.desc {
+            font-size: 11px;
+            color: var(--text-muted);
+            display: block;
+        }
+
+        /* Custom Toggle Switch */
+        .toggle-switch {
+            position: relative;
+            display: inline-block;
+            width: 44px;
+            height: 24px;
+        }
+        .toggle-switch input { opacity: 0; width: 0; height: 0; }
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background-color: #334155;
+            transition: .3s;
+            border-radius: 24px;
+        }
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 18px;
+            width: 18px;
+            left: 3px;
+            bottom: 3px;
+            background-color: white;
+            transition: .3s;
+            border-radius: 50%;
+        }
+        input:checked + .slider { background-color: var(--primary); }
+        input:checked + .slider:before { transform: translateX(20px); }
+
+        /* Action Buttons */
+        .action-btns {
+            display: grid;
+            grid-template-columns: 1fr 100px;
+            gap: 10px;
+        }
+        .btn-launch {
+            background: var(--primary-gradient);
+            color: #fff;
+            border: none;
+            padding: 13px 20px;
+            border-radius: 10px;
+            font-weight: 700;
+            font-size: 14px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            box-shadow: 0 4px 15px rgba(37, 99, 235, 0.4);
+            transition: all 0.2s;
+        }
+        .btn-launch:hover:not(:disabled) {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 20px rgba(56, 189, 248, 0.5);
+            filter: brightness(1.1);
+        }
+        .btn-launch:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            box-shadow: none;
+        }
+        .btn-abort {
+            background: rgba(244, 63, 94, 0.15);
+            color: var(--accent-red);
+            border: 1px solid rgba(244, 63, 94, 0.3);
+            border-radius: 10px;
+            font-weight: 700;
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .btn-abort:hover:not(:disabled) {
+            background: var(--accent-red);
+            color: white;
+        }
+        .btn-abort:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+
+        /* Right Panel: Tabs */
+        .tabs-header {
+            display: flex;
+            gap: 4px;
+        }
+        .tab-btn {
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
+            padding: 8px 16px;
+            font-size: 13px;
+            font-weight: 600;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .tab-btn.active {
+            background: rgba(56, 189, 248, 0.12);
+            color: var(--primary);
+        }
+
+        /* Live Terminal */
+        .terminal-container {
+            background: #030712;
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            flex-grow: 1;
+            height: 400px;
+            padding: 16px;
+            overflow-y: auto;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            line-height: 1.7;
+        }
+        .log-entry {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 3px;
+        }
+        .log-time { color: var(--text-muted); user-select: none; }
+        .log-text { color: #e2e8f0; word-break: break-all; }
+        .log-text.info { color: #38bdf8; }
+        .log-text.success { color: #4ade80; font-weight: 600; }
+        .log-text.warning { color: #facc15; }
+        .log-text.error { color: #f87171; font-weight: 600; }
+
+        /* Visual Gallery Tab */
+        .gallery-container {
             display: none;
+            flex-grow: 1;
+            overflow-y: auto;
+            max-height: 480px;
+            gap: 16px;
+            flex-direction: column;
+        }
+        .gallery-item {
+            background: #060911;
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: 14px;
+        }
+        .gallery-item-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+            font-size: 13px;
+            font-weight: 600;
+        }
+        .gallery-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+        .shot-box {
+            background: #030712;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            overflow: hidden;
+            text-align: center;
+        }
+        .shot-label {
+            font-size: 11px;
+            font-weight: 600;
+            padding: 6px;
+            background: var(--bg-subtle);
+            color: var(--text-muted);
+        }
+        .shot-box img {
+            width: 100%;
+            height: 160px;
+            object-fit: cover;
+            object-position: top;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        .shot-box img:hover { transform: scale(1.02); }
+
+        /* Progress Footer */
+        .footer-progress {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 14px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .progress-details {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+        .spinner {
+            width: 18px;
+            height: 18px;
+            border: 2px solid rgba(56, 189, 248, 0.2);
+            border-top-color: var(--primary);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            display: none;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .footer-status-text {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-title);
+        }
+        .report-btn {
+            background: rgba(56, 189, 248, 0.15);
+            color: var(--primary);
+            border: 1px solid rgba(56, 189, 248, 0.3);
+            padding: 8px 16px;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 600;
+            text-decoration: none;
+            display: none;
+            transition: all 0.2s;
+        }
+        .report-btn:hover {
+            background: var(--primary);
+            color: #030712;
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <header>
-            <div>
-                <h1>WordPress Plugins & Themes Auto-Updater</h1>
-                <div class="tagline">Playwright Human-Like Automation &amp; Visual Verification Engine</div>
-            </div>
-            <div class="badge-live">&#9679; Browser Ready</div>
-        </header>
 
-        <div class="grid">
-            <!-- Left Panel: Input -->
+    <!-- Navigation Header -->
+    <header class="navbar">
+        <div class="brand">
+            <div class="logo-icon">&#9881;</div>
+            <div class="brand-text">
+                <h1>WordPress Sentinel Updater <span class="version">v2.5 Pro</span></h1>
+                <p>Playwright Autonomous Engine &bull; Human-Like Emulation &bull; Visual Verification</p>
+            </div>
+        </div>
+        <div class="nav-actions">
+            <button class="chip" onclick="openReportsFolder()">&#128193; Open Reports Folder</button>
+            <button class="chip" onclick="openScreenshotsFolder()">&#128247; Screenshots Folder</button>
+            <div class="status-badge">
+                <div class="pulse-dot"></div>
+                <span id="engineBadge">Engine Ready (Chrome Verified)</span>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Workspace -->
+    <main class="main-content">
+
+        <!-- Top Metrics Row -->
+        <div class="metrics-grid">
+            <div class="metric-card">
+                <div class="metric-label">Target Queue</div>
+                <div class="metric-value highlight-blue" id="kpiTotal">0</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Healthy &amp; Verified</div>
+                <div class="metric-value highlight-green" id="kpiHealthy">0</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Critical Issues</div>
+                <div class="metric-value highlight-red" id="kpiFailed">0</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Plugins Updated</div>
+                <div class="metric-value" id="kpiPlugins">0</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Themes Updated</div>
+                <div class="metric-value" id="kpiThemes">0</div>
+            </div>
+        </div>
+
+        <!-- Dual Column Workspace -->
+        <div class="workspace-grid">
+
+            <!-- Left Column: Input & Controls -->
             <div class="panel">
-                <h2>
-                    <span>Websites &amp; Temporary Login URLs</span>
-                    <button class="btn-secondary" style="padding: 4px 10px; font-size: 12px;" onclick="loadDemoUrl()">Load Local Demo URL</button>
-                </h2>
-                <textarea id="siteInput" placeholder="Enter one Temporary Login URL per line:&#10;https://example.com/wp-admin/?wtlwp_token=xyz123...&#10;https://mysite.com | https://mysite.com/wp-admin/?wtlwp_token=abc456..."></textarea>
-                <div class="controls">
-                    <button id="startBtn" class="btn-start" onclick="startUpdate()">&#9654; Start Updating</button>
-                    <button id="stopBtn" class="btn-stop" onclick="stopUpdate()" disabled>&#9632; Stop</button>
-                    <label class="checkbox-label">
-                        <input type="checkbox" id="headlessMode">
-                        Headless Mode (Hide Browser Window)
-                    </label>
+                <div class="panel-header">
+                    <h2>&#128279; Target Websites &amp; Temporary Logins</h2>
+                    <span style="font-size: 11px; color: var(--text-muted);">One URL per line</span>
+                </div>
+                <div class="panel-body">
+                    <div class="editor-wrapper">
+                        <textarea id="siteInput" class="code-editor" spellcheck="false" placeholder="# Paste your Temporary Login URLs here:&#10;https://example.com/wp-admin/?wtlwp_token=xyz123...&#10;&#10;# Or with explicit site label:&#10;https://mysite.com | https://mysite.com/wp-admin/?wtlwp_token=abc456..."></textarea>
+                        <div class="chips-bar">
+                            <span class="chip" onclick="loadDemoUrl()">+ Load Demo Test Link</span>
+                            <span class="chip" onclick="clearInput()">Clear</span>
+                        </div>
+                    </div>
+
+                    <!-- Browser & Automation Settings -->
+                    <div class="config-box">
+                        <div class="switch-row">
+                            <div>
+                                <span class="label">Interactive Browser Window (Headed)</span>
+                                <span class="desc">Open real Google Chrome on screen to watch updates live</span>
+                            </div>
+                            <label class="toggle-switch">
+                                <input type="checkbox" id="interactiveMode" checked>
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                        <div class="switch-row">
+                            <div>
+                                <span class="label">Natural Human Emulation</span>
+                                <span class="desc">Randomized mouse paths, scroll pauses, popup dismissals</span>
+                            </div>
+                            <label class="toggle-switch">
+                                <input type="checkbox" checked disabled>
+                                <span class="slider" style="background-color: var(--accent-green);"></span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <!-- Action Controls -->
+                    <div class="action-btns">
+                        <button id="launchBtn" class="btn-launch" onclick="startUpdate()">
+                            &#9654; Run Autonomous Updater
+                        </button>
+                        <button id="abortBtn" class="btn-abort" onclick="stopUpdate()" disabled>
+                            &#9632; Stop
+                        </button>
+                    </div>
                 </div>
             </div>
 
-            <!-- Right Panel: Live Terminal -->
+            <!-- Right Column: Command Center & Live Monitor -->
             <div class="panel">
-                <h2>
-                    <span>Live Execution Logs</span>
-                    <button class="btn-secondary" style="padding: 4px 10px; font-size: 12px;" onclick="clearLogs()">Clear</button>
-                </h2>
-                <div id="terminal" class="terminal">[Ready] Add temporary login URLs and click 'Start Updating'...</div>
+                <div class="panel-header">
+                    <div class="tabs-header">
+                        <button id="tabLogs" class="tab-btn active" onclick="switchTab('logs')">&#128187; Live Console</button>
+                        <button id="tabVisual" class="tab-btn" onclick="switchTab('visual')">&#128248; Visual Health Monitor</button>
+                    </div>
+                    <button class="chip" onclick="clearConsole()">Clear Logs</button>
+                </div>
+                <div class="panel-body" style="padding: 16px;">
+                    <!-- Terminal Tab -->
+                    <div id="terminal" class="terminal-container">
+                        <div class="log-entry">
+                            <span class="log-time">[System]</span>
+                            <span class="log-text info">WP Auto-Updater Enterprise engine online.</span>
+                        </div>
+                        <div class="log-entry">
+                            <span class="log-time">[System]</span>
+                            <span class="log-text">Paste temporary login URLs on the left and click 'Run Autonomous Updater'.</span>
+                        </div>
+                    </div>
+
+                    <!-- Visual Gallery Tab -->
+                    <div id="gallery" class="gallery-container">
+                        <div style="text-align: center; padding: 40px 0; color: var(--text-muted); font-size: 13px;" id="noScreenshotsNotice">
+                            No screenshots captured yet. Run an update to view Before &amp; After health comparisons.
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- Footer Status & Report Link -->
+        <div class="footer-progress">
+            <div class="progress-details">
+                <div class="spinner" id="loadingSpinner"></div>
+                <div class="footer-status-text" id="footerStatus">Ready. Add temporary login URLs to begin.</div>
+            </div>
+            <div>
+                <a id="viewReportBtn" class="report-btn" href="#" target="_blank">&#128196; View Full HTML Report</a>
             </div>
         </div>
 
-        <div class="status-bar">
-            <div>
-                <span style="color: var(--text-muted); margin-right: 8px;">Status:</span>
-                <span id="statusMsg" class="progress-text">Ready.</span>
-            </div>
-            <div>
-                <a id="reportLink" class="report-link" href="#" target="_blank">&#128196; View HTML Verification Report</a>
-            </div>
-        </div>
-    </div>
+    </main>
 
     <script>
         let isPolling = false;
 
         function loadDemoUrl() {
             document.getElementById('siteInput').value = "http://127.0.0.1:8765/wp-admin/?wtlwp_token=demo_test_token_123";
-            appendLocalLog("Loaded local demo test URL. Click 'Start Updating' to test safely!");
+            appendLocalLog("Loaded local demo WordPress test link. Click 'Run Autonomous Updater' to test without touching live sites!");
+        }
+
+        function clearInput() {
+            document.getElementById('siteInput').value = "";
+        }
+
+        function clearConsole() {
+            document.getElementById('terminal').innerHTML = '<div class="log-entry"><span class="log-time">[System]</span><span class="log-text">Console cleared.</span></div>';
+        }
+
+        function switchTab(tab) {
+            const tabLogs = document.getElementById('tabLogs');
+            const tabVisual = document.getElementById('tabVisual');
+            const term = document.getElementById('terminal');
+            const gallery = document.getElementById('gallery');
+
+            if (tab === 'logs') {
+                tabLogs.classList.add('active');
+                tabVisual.classList.remove('active');
+                term.style.display = 'block';
+                gallery.style.display = 'none';
+            } else {
+                tabLogs.classList.remove('active');
+                tabVisual.classList.add('active');
+                term.style.display = 'none';
+                gallery.style.display = 'flex';
+            }
         }
 
         function appendLocalLog(msg) {
             const term = document.getElementById('terminal');
             const time = new Date().toTimeString().split(' ')[0];
-            term.innerText += `\\n[${time}] ${msg}`;
+            const div = document.createElement('div');
+            div.className = 'log-entry';
+            div.innerHTML = `<span class="log-time">[${time}]</span><span class="log-text info">${msg}</span>`;
+            term.appendChild(div);
             term.scrollTop = term.scrollHeight;
-        }
-
-        function clearLogs() {
-            document.getElementById('terminal').innerText = "[Terminal cleared]";
         }
 
         async function startUpdate() {
             const rawText = document.getElementById('siteInput').value.trim();
             if (!rawText) {
-                alert("Please paste at least one Temporary Login URL.");
+                alert("Please paste at least one Temporary Login URL in the target list.");
                 return;
             }
 
             const lines = rawText.split('\\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
-            const headless = document.getElementById('headlessMode').checked;
+            const interactive = document.getElementById('interactiveMode').checked;
+            const headless = !interactive; // Checked means interactive (headless = false)
 
-            document.getElementById('startBtn').disabled = true;
-            document.getElementById('stopBtn').disabled = false;
-            document.getElementById('reportLink').style.display = 'none';
+            document.getElementById('launchBtn').disabled = true;
+            document.getElementById('abortBtn').disabled = false;
+            document.getElementById('loadingSpinner').style.display = 'block';
+            document.getElementById('viewReportBtn').style.display = 'none';
 
             try {
                 const res = await fetch('/api/start', {
@@ -288,19 +815,23 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     if (!isPolling) startPolling();
                 } else {
                     alert(data.message);
-                    document.getElementById('startBtn').disabled = false;
-                    document.getElementById('stopBtn').disabled = true;
+                    resetUIState();
                 }
             } catch (err) {
-                alert("Error starting update: " + err);
-                document.getElementById('startBtn').disabled = false;
-                document.getElementById('stopBtn').disabled = true;
+                alert("Error starting pipeline: " + err);
+                resetUIState();
             }
         }
 
         async function stopUpdate() {
             await fetch('/api/stop', { method: 'POST' });
-            document.getElementById('stopBtn').disabled = true;
+            document.getElementById('abortBtn').disabled = true;
+        }
+
+        function resetUIState() {
+            document.getElementById('launchBtn').disabled = false;
+            document.getElementById('abortBtn').disabled = true;
+            document.getElementById('loadingSpinner').style.display = 'none';
         }
 
         function startPolling() {
@@ -310,19 +841,31 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     const res = await fetch('/api/status');
                     const data = await res.json();
 
-                    document.getElementById('statusMsg').innerText = data.status_msg;
-                    document.getElementById('terminal').innerText = data.logs.join('\\n');
-                    document.getElementById('terminal').scrollTop = document.getElementById('terminal').scrollHeight;
+                    // Update Status text
+                    document.getElementById('footerStatus').innerText = data.status_msg;
 
+                    // Update Metrics
+                    document.getElementById('kpiTotal').innerText = data.stats.total;
+                    document.getElementById('kpiHealthy').innerText = data.stats.healthy;
+                    document.getElementById('kpiFailed').innerText = data.stats.failed;
+                    document.getElementById('kpiPlugins').innerText = data.stats.plugins_updated;
+                    document.getElementById('kpiThemes').innerText = data.stats.themes_updated;
+
+                    // Render Logs with coloring
+                    renderLogs(data.logs);
+
+                    // Render Screenshots
+                    renderGallery(data.recent_screenshots);
+
+                    // Report button
                     if (data.latest_report) {
-                        const rLink = document.getElementById('reportLink');
-                        rLink.href = data.latest_report;
-                        rLink.style.display = 'inline-block';
+                        const rBtn = document.getElementById('viewReportBtn');
+                        rBtn.href = data.latest_report;
+                        rBtn.style.display = 'inline-block';
                     }
 
                     if (!data.is_running) {
-                        document.getElementById('startBtn').disabled = false;
-                        document.getElementById('stopBtn').disabled = true;
+                        resetUIState();
                         clearInterval(timer);
                         isPolling = false;
                     }
@@ -331,6 +874,71 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 }
             }, 1000);
         }
+
+        function renderLogs(logs) {
+            const term = document.getElementById('terminal');
+            term.innerHTML = '';
+            logs.forEach(log => {
+                const div = document.createElement('div');
+                div.className = 'log-entry';
+
+                let textClass = '';
+                const lower = log.text.toLowerCase();
+                if (lower.includes('success') || lower.includes('healthy') || lower.includes('verified')) {
+                    textClass = 'success';
+                } else if (lower.includes('alert') || lower.includes('error') || lower.includes('critical') || lower.includes('fatal')) {
+                    textClass = 'error';
+                } else if (lower.includes('warning') || lower.includes('notice')) {
+                    textClass = 'warning';
+                } else if (lower.includes('step') || lower.includes('processing')) {
+                    textClass = 'info';
+                }
+
+                div.innerHTML = `<span class="log-time">[${log.time}]</span><span class="log-text ${textClass}">${log.text}</span>`;
+                term.appendChild(div);
+            });
+            term.scrollTop = term.scrollHeight;
+        }
+
+        function renderGallery(shots) {
+            const gallery = document.getElementById('gallery');
+            if (!shots || shots.length === 0) return;
+
+            document.getElementById('noScreenshotsNotice')?.remove();
+            gallery.innerHTML = '';
+
+            shots.forEach(item => {
+                const card = document.createElement('div');
+                card.className = 'gallery-item';
+                card.innerHTML = `
+                    <div class="gallery-item-header">
+                        <span>${item.url}</span>
+                        <span style="color: ${item.healthy ? 'var(--accent-green)' : 'var(--accent-red)'}">
+                            ${item.healthy ? '&#9679; Healthy (HTTP ' + item.status_code + ')' : '&#9888; Critical Alert'}
+                        </span>
+                    </div>
+                    <div class="gallery-grid">
+                        <div class="shot-box">
+                            <div class="shot-label">Before Update</div>
+                            ${item.before ? `<img src="${item.before}" onclick="window.open(this.src)" alt="Before">` : '<p style="padding:40px;color:gray;">No image</p>'}
+                        </div>
+                        <div class="shot-box">
+                            <div class="shot-label">After Update</div>
+                            ${item.after ? `<img src="${item.after}" onclick="window.open(this.src)" alt="After">` : '<p style="padding:40px;color:gray;">No image</p>'}
+                        </div>
+                    </div>
+                `;
+                gallery.appendChild(card);
+            });
+        }
+
+        function openReportsFolder() {
+            fetch('/api/open-folder?type=reports');
+        }
+
+        function openScreenshotsFolder() {
+            fetch('/api/open-folder?type=screenshots');
+        }
     </script>
 </body>
 </html>
@@ -338,22 +946,22 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
 @app.route("/")
 def index():
-    return render_template_string(HTML_DASHBOARD)
+    return render_template_string(HTML_PROFESSIONAL_DASHBOARD)
 
 @app.route("/api/start", methods=["POST"])
 def api_start():
     global orchestrator_instance
     if execution_state["is_running"]:
-        return jsonify({"status": "error", "message": "Updater is already running."}), 400
+        return jsonify({"status": "error", "message": "Pipeline already actively running."}), 400
 
     payload = request.get_json() or {}
     lines = payload.get("lines", [])
     headless = payload.get("headless", False)
 
     if not lines:
-        return jsonify({"status": "error", "message": "No URLs provided."}), 400
+        return jsonify({"status": "error", "message": "No target URLs provided."}), 400
 
-    # Check if local demo URL is included, ensure mock server is running
+    # Auto-start mock server if local test URL is present
     for line in lines:
         if "127.0.0.1:8765" in line:
             start_local_mock_server_if_needed()
@@ -363,13 +971,22 @@ def api_start():
     execution_state["latest_report"] = None
     execution_state["current"] = 0
     execution_state["total"] = len(lines)
-    execution_state["status_msg"] = f"Starting updates for {len(lines)} site(s)..."
+    execution_state["stats"] = {
+        "total": len(lines),
+        "healthy": 0,
+        "failed": 0,
+        "plugins_updated": 0,
+        "themes_updated": 0
+    }
+    execution_state["recent_screenshots"] = []
+    execution_state["status_msg"] = f"Initializing update pipeline for {len(lines)} site(s)..."
 
     orchestrator_instance = UpdateOrchestrator(
         raw_lines=lines,
         headless=headless,
         log_callback=append_log,
-        progress_callback=update_progress
+        progress_callback=update_progress,
+        site_update_callback=on_site_updated
     )
 
     def _worker():
@@ -381,10 +998,9 @@ def api_start():
             if report_p:
                 filename = os.path.basename(report_p)
                 execution_state["latest_report"] = f"/reports/{filename}"
-            execution_state["results"] = res.get("results", [])
-            execution_state["status_msg"] = "Finished all operations."
+            execution_state["status_msg"] = "Pipeline completed successfully."
         except Exception as e:
-            append_log(f"Fatal error: {e}")
+            append_log(f"Fatal error in pipeline: {e}")
             execution_state["status_msg"] = f"Error: {e}"
         finally:
             execution_state["is_running"] = False
@@ -400,12 +1016,22 @@ def api_stop():
     global orchestrator_instance
     if orchestrator_instance:
         orchestrator_instance.stop()
-        append_log("Stop signal sent. Stopping after current task...")
+        append_log("Cancellation requested. Stopping after current task finishes...")
     return jsonify({"status": "stopping"})
 
 @app.route("/api/status", methods=["GET"])
 def api_status():
     return jsonify(execution_state)
+
+@app.route("/api/open-folder", methods=["GET"])
+def api_open_folder():
+    folder_type = request.args.get("type", "reports")
+    target = config.REPORTS_DIR if folder_type == "reports" else config.SCREENSHOTS_DIR
+    try:
+        os.startfile(str(target.resolve()))
+    except Exception as e:
+        pass
+    return jsonify({"status": "ok"})
 
 @app.route("/reports/<path:filename>")
 def serve_report(filename):
@@ -421,19 +1047,17 @@ def start_local_mock_server_if_needed():
         t = threading.Thread(target=test_local_server.run_server, daemon=True)
         t.start()
         mock_server_running = True
-        append_log("Auto-started background mock WordPress test server on http://127.0.0.1:8765")
+        append_log("Auto-started mock WordPress server at http://127.0.0.1:8765")
 
 def launch_server():
     port = 5050
-    # Auto-open browser in 1.2 seconds
     def _open():
         time.sleep(1.2)
         webbrowser.open(f"http://127.0.0.1:{port}")
     threading.Thread(target=_open, daemon=True).start()
 
-    print(f"Starting Web Dashboard at http://127.0.0.1:{port}")
+    print(f"Starting Professional Web Dashboard at http://127.0.0.1:{port}")
     app.run(host="127.0.0.1", port=port, debug=False)
 
 if __name__ == "__main__":
     launch_server()
-
